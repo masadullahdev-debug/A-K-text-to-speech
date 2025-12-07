@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Text to Speech</title>
+
+<!-- PDF Reader -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.14.305/pdf.min.js"></script>
+
+<!-- DOCX Reader -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/docx/7.3.0/docx.min.js"></script>
+
+<!-- LameJS for MP3 conversion -->
+<script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.0/lame.min.js"></script>
+
+<style>
+    /* KEPT EXACT STYLES — you asked not to change styling */
+    body {
+        margin: 0;
+        font-family: Arial, sans-serif;
+        background:
+            radial-gradient(circle at 20% 30%, #ff0099 0%, #330033 40%, #000 80%),
+            radial-gradient(circle at 80% 70%, #00ccff 0%, #002244 40%, #000 80%),
+            radial-gradient(circle at 50% 50%, #ff6600 0%, #220000 40%, #000 80%);
+        background-blend-mode: screen;
+        min-height: 100vh;
+        display: flex;
+        justify-content: center;
+        padding-top: 40px;
+        color: #fff;
+    }
+
+    .wrap {
+        width: 820px;
+        max-width: 95%;
+    }
+
+    textarea {
+        width: 100%;
+        height: 330px;
+        border: none;
+        border-radius: 6px;
+        padding: 20px;
+        font-size: 22px;
+        font-weight: 700;
+        color: #111;
+        background: #fff;
+        box-shadow: 0 7px 22px rgba(0,0,0,0.5);
+        resize: none;
+    }
+
+    .btn {
+        background: #ffca28;
+        border: none;
+        color: #111;
+        padding: 12px 24px;
+        font-size: 20px;
+        font-weight: 800;
+        border-radius: 28px;
+        cursor: pointer;
+        margin: 8px;
+        min-width: 180px;
+        text-align: center;
+        box-shadow: 0 6px 16px rgba(0,0,0,0.4);
+        transition: 0.12s ease-in-out;
+        text-decoration: none;
+        display: inline-block;
+    }
+
+    .btn:hover { transform: translateY(-3px); }
+
+    input[type="file"] { display: none; }
+
+    .controls { display: flex; justify-content: center; gap: 12px; flex-wrap: wrap; margin-top: 14px; }
+
+    .speak-btn { font-size: 24px; min-width: 260px; border-radius: 32px; }
+
+    .download-wrap { display: flex; justify-content: center; margin-top: 14px; }
+
+    .download-btn { font-size: 20px; padding: 12px 20px; min-width: 220px; border-radius: 34px; }
+
+    .voice-select { display:flex; justify-content:center; gap:18px; margin-top:12px; }
+
+    #status { text-align:center; margin-top:10px; color:#c8f7ff; font-size:16px; }
+</style>
+</head>
+
+<body>
+
+<div class="wrap">
+
+    <textarea id="textInput" placeholder="enter or upload text"></textarea>
+
+    <!-- Voice Select -->
+    <div class="voice-select">
+        <button class="btn" onclick="setVoice('man')">man</button>
+        <button class="btn" onclick="setVoice('woman')">woman</button>
+    </div>
+
+    <!-- Buttons -->
+    <div class="controls">
+        <button class="btn" onclick="stopSpeak()">stop</button>
+
+        <label for="fileUpload" class="btn">upload file</label>
+        <input type="file" id="fileUpload" accept=".pdf,.docx,.txt">
+
+        <label for="imageUpload" class="btn">upload image</label>
+        <input type="file" id="imageUpload" accept="image/*">
+    </div>
+
+    <!-- Speak -->
+    <div class="download-wrap">
+        <button class="btn speak-btn" onclick="speak()">speak</button>
+    </div>
+
+    <!-- Download: anchor used for file download -->
+    <div class="download-wrap">
+        <a class="btn download-btn" id="downloadLink" disabled>download (none)</a>
+    </div>
+
+    <div id="status"></div>
+
+</div>
+
+<script>
+/* ============================
+   KEEP ORIGINAL TEXT CLEANER
+===============================*/
+function keepOnlyEnglish(text) {
+    return text
+        .replace(/[^a-zA-Z0-9 \n\.\,\!\?\:\;\"\'\-\(\)]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+/* ============================
+   VOICE SELECT
+===============================*/
+let currentVoiceType = "woman";
+function setVoice(type) {
+    currentVoiceType = type;
+    setStatus("Voice set to " + type);
+}
+
+/* Utility: status */
+function setStatus(t) {
+    document.getElementById("status").innerText = t;
+}
+
+/* ============================
+   RECORDING (Direct Tab/System Audio)
+   Approach:
+   1) Try navigator.mediaDevices.getDisplayMedia({audio:true}) to capture tab/system audio (preferred).
+   2) If not available or denied, gracefully fallback to microphone (getUserMedia).
+   3) Use MediaRecorder to capture stream reliably.
+   4) Convert final recording to MP3 (via lamejs) for universal download.
+===============================*/
+
+let mediaRecorder = null;
+let recordedChunks = [];
+let activeStream = null;
+let lastObjectURL = null;
+
+/* prefer mime */
+function selectMimeType() {
+    if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) return "audio/webm;codecs=opus";
+    if (MediaRecorder.isTypeSupported("audio/webm")) return "audio/webm";
+    if (MediaRecorder.isTypeSupported("audio/wav")) return "audio/wav";
+    return "";
+}
+
+/* Clean previous URL to avoid memory leak */
+function revokeLastURL() {
+    if (lastObjectURL) {
+        try { URL.revokeObjectURL(lastObjectURL); } catch(e) {}
+        lastObjectURL = null;
+    }
+}
+
+/* Start a recording using display capture (tab audio) or fallback to mic */
+async function startRecordingDirect() {
+    // reset
+    recordedChunks = [];
+    revokeLastURL();
+
+    const mimeType = selectMimeType();
+    let stream = null;
+    // Try display capture first (tab audio)
+    if (navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia) {
+        try {
+            // Ask user to share "this tab" (or a window/screen). In Chrome you can select 'Share tab' and tick 'share audio'
+            setStatus("Requesting tab/screen audio (choose the tab and enable 'Share audio')…");
+            stream = await navigator.mediaDevices.getDisplayMedia({ video: false, audio: true });
+            // Some browsers may return video track even if video:false; ignore video tracks
+            if (stream && stream.getAudioTracks().length === 0) {
+                // no audio track returned
+                stream.getTracks().forEach(t => t.stop());
+                stream = null;
+            } else {
+                setStatus("Captured tab/system audio.");
+            }
+        } catch (err) {
+            // user denied or not supported; we'll fallback
+            console.warn("getDisplayMedia failed:", err);
+            stream = null;
+            setStatus("Tab audio capture not available or denied — will try microphone as fallback.");
+        }
+    }
+
+    // Fallback: microphone
+    if (!stream && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        try {
+            setStatus("Requesting microphone (fallback)...");
+            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            setStatus("Microphone recording active (fallback).");
+        } catch (err) {
+            setStatus("Cannot access audio (display or mic). Download will be unavailable.");
+            throw err;
+        }
+    }
+
+    if (!stream) {
+        throw new Error("No audio stream available for recording.");
+    }
+
+    activeStream = stream;
+    // If stream contains multiple tracks, we can optionally filter to audio only
+    const audioOnly = new MediaStream(stream.getAudioTracks());
+
+    // create mediaRecorder
+    try {
+        mediaRecorder = (mimeType) ? new MediaRecorder(audioOnly, { mimeType }) : new MediaRecorder(audioOnly);
+    } catch (err) {
+        // some browsers may still throw — try default
+        mediaRecorder = new MediaRecorder(audioOnly);
+    }
+
+    mediaRecorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) recordedChunks.push(ev.data);
+    };
+
+    mediaRecorder.onstop = async () => {
+        setStatus("Recording stopped — preparing file...");
+        // create blob from chunks
+        const webBlob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || "audio/webm" });
+
+        // Convert to MP3 (preferred). If lamejs available, convert; else provide WebM/WAV fallback.
+        if (typeof lamejs !== "undefined") {
+            try {
+                setStatus("Converting to MP3 (this may take a moment)...");
+                const mp3Blob = await convertWebAudioBlobToMp3(webBlob);
+                prepareDownload(mp3Blob, "speech.mp3");
+                setStatus("MP3 ready ✓");
+            } catch (err) {
+                console.error("MP3 conversion failed:", err);
+                // fallback to webm
+                prepareDownload(webBlob, "speech.webm");
+                setStatus("Saved as WebM (MP3 conversion failed).");
+            }
+        } else {
+            // no lamejs — provide the original
+            prepareDownload(webBlob, "speech.webm");
+            setStatus("Saved as WebM (lamejs missing).");
+        }
+
+        // stop & release stream tracks
+        try {
+            if (activeStream) activeStream.getTracks().forEach(t => t.stop());
+        } catch (e) {}
+        activeStream = null;
+    };
+
+    mediaRecorder.start();
+    setStatus("Recording started...");
+}
+
+/* Stop recording (and triggers 'onstop' event handler) */
+function stopRecordingDirect() {
+    if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        mediaRecorder.stop();
+    }
+    // activeStream tracks will be stopped in onstop handler
+}
+
+/* Prepare download link for final blob */
+function prepareDownload(blob, filename) {
+    revokeLastURL();
+    const url = URL.createObjectURL(blob);
+    lastObjectURL = url;
+
+    const link = document.getElementById("downloadLink");
+    link.href = url;
+    link.download = filename;
+    link.removeAttribute("disabled");
+    link.innerText = "download (" + filename + ")";
+}
+
+/* Convert captured audio Blob (webm/wav) to MP3 using lamejs
+   Steps:
+   1) Decode audio into AudioBuffer using AudioContext
+   2) Extract PCM samples (mono)
+   3) Feed to lamejs Mp3Encoder
+*/
+async function convertWebAudioBlobToMp3(blob) {
+    // decode audio
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioCtx = new (window.OfflineAudioContext || window.AudioContext)(1, 2, 44100);
+    // decodeAudioData requires a real AudioContext, create temporary one if needed
+    const decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
+    let audioBuffer;
+    try {
+        audioBuffer = await decodeCtx.decodeAudioData(arrayBuffer);
+    } catch (e) {
+        // Some browsers require promise-style decode
+        audioBuffer = await new Promise((res, rej) => {
+            decodeCtx.decodeAudioData(arrayBuffer, res, rej);
+        });
+    }
+
+    // take first channel (mono). If multiple channels, mix down.
+    const channelData = audioBuffer.numberOfChannels > 1
+        ? mixChannelsToMono(audioBuffer)
+        : audioBuffer.getChannelData(0);
+
+    const sampleRate = audioBuffer.sampleRate || 44100;
+
+    // LameJS wants Int16 samples
+    const mp3Encoder = new lamejs.Mp3Encoder(1, sampleRate, 128);
+    const samplesPerFrame = 1152;
+    let mp3Data = [];
+
+    // convert Float32 [-1,1] to Int16
+    let remaining = channelData.length;
+    let sampleIndex = 0;
+    while (remaining >= samplesPerFrame) {
+        const sampleChunk = channelData.subarray(sampleIndex, sampleIndex + samplesPerFrame);
+        const int16Chunk = floatTo16BitPCM(sampleChunk);
+        const mp3buf = mp3Encoder.encodeBuffer(int16Chunk);
+        if (mp3buf.length > 0) mp3Data.push(mp3buf);
+        sampleIndex += samplesPerFrame;
+        remaining -= samplesPerFrame;
+    }
+
+    // tail
+    const tail = channelData.subarray(sampleIndex);
+    if (tail.length > 0) {
+        const int16Tail = floatTo16BitPCM(tail);
+        const mp3buf = mp3Encoder.encodeBuffer(int16Tail);
+        if (mp3buf.length > 0) mp3Data.push(mp3buf);
+    }
+
+    const flush = mp3Encoder.flush();
+    if (flush.length > 0) mp3Data.push(flush);
+
+    // build blob
+    const blobData = new Blob(mp3Data, { type: "audio/mp3" });
+    return blobData;
+}
+
+/* Helper: mix multiple channels to mono Float32Array */
+function mixChannelsToMono(audioBuffer) {
+    const len = audioBuffer.length;
+    const channels = audioBuffer.numberOfChannels;
+    const output = new Float32Array(len);
+    for (let c = 0; c < channels; c++) {
+        const ch = audioBuffer.getChannelData(c);
+        for (let i = 0; i < len; i++) output[i] += ch[i] / channels;
+    }
+    return output;
+}
+
+/* Helper: convert Float32Array [-1..1] to Int16Array */
+function floatTo16BitPCM(float32Array) {
+    const l = float32Array.length;
+    const int16 = new Int16Array(l);
+    for (let i = 0; i < l; i++) {
+        let s = Math.max(-1, Math.min(1, float32Array[i]));
+        int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return int16;
+}
+
+/* ============================
+   SPEAK FLOW: start recording first, then speak, then stop recording on end
+===============================*/
+async function ensureVoicesLoaded() {
+    return new Promise(resolve => {
+        let voices = speechSynthesis.getVoices();
+        if (voices.length) return resolve(voices);
+        speechSynthesis.onvoiceschanged = () => resolve(speechSynthesis.getVoices());
+        setTimeout(() => resolve(speechSynthesis.getVoices()), 800);
+    });
+}
+
+async function speak() {
+    const raw = document.getElementById("textInput").value;
+    const text = keepOnlyEnglish(raw);
+
+    if (!text) {
+        alert("Enter English text first!");
+        return;
+    }
+
+    setStatus("Preparing...");
+
+    // Start recording (direct tab/system audio preferred)
+    try {
+        await startRecordingDirect();
+    } catch (err) {
+        // already set status inside startRecordingDirect
+        console.warn("Recording start failed:", err);
+    }
+
+    // pick voice
+    const voices = await ensureVoicesLoaded();
+    let voice =
+        voices.find(v => {
+            if (currentVoiceType === "man") return /male|man|David|Daniel|Alex|Mark/i.test(v.name);
+            return /female|woman|Google UK English Female|Samantha|Alloy/i.test(v.name);
+        }) || voices.find(v => v.name.toLowerCase().includes("google")) || voices[0];
+
+    const utter = new SpeechSynthesisUtterance(text);
+    if (voice) utter.voice = voice;
+    utter.pitch = currentVoiceType === "man" ? 0.8 : 1.1;
+    utter.rate = 0.95;
+    utter.volume = 1;
+
+    utter.onend = () => {
+        // stop recording when speech ends
+        try { stopRecordingDirect(); } catch (e) { console.warn(e); }
+    };
+
+    utter.onerror = (e) => {
+        setStatus("Speech error: " + (e.error || e.message || "unknown"));
+        try { stopRecordingDirect(); } catch(e){}
+    };
+
+    // speak
+    speechSynthesis.cancel();
+    speechSynthesis.speak(utter);
+    setStatus("Speaking...");
+}
+
+/* Stop speaking and recording immediately */
+function stopSpeak() {
+    speechSynthesis.cancel();
+    try { stopRecordingDirect(); } catch (e) {}
+    setStatus("Stopped.");
+}
+
+/* ============================
+   File upload handlers (kept as original)
+===============================*/
+document.getElementById("fileUpload").addEventListener("change", async function () {
+    const file = this.files[0];
+    if (!file) return;
+
+    const name = file.name.toLowerCase();
+
+    if (name.endsWith(".txt")) {
+        const text = await file.text();
+        document.getElementById("textInput").value = keepOnlyEnglish(text);
+        return;
+    }
+
+    if (name.endsWith(".pdf")) {
+        const buffer = await file.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument(buffer).promise;
+
+        let text = "";
+        for (let i = 1; i <= pdf.numPages; i++) {
+            const page = await pdf.getPage(i);
+            const content = await page.getTextContent();
+            text += content.items.map(x => x.str).join(" ") + " ";
+        }
+
+        document.getElementById("textInput").value = keepOnlyEnglish(text);
+    }
+
+    if (name.endsWith(".docx")) {
+        const buffer = await file.arrayBuffer();
+        const doc = await window.docx.parseDocx(buffer);
+        if (doc && doc.getFullText) {
+            document.getElementById("textInput").value = keepOnlyEnglish(doc.getFullText());
+        } else {
+            setStatus("Could not parse DOCX file.");
+        }
+    }
+});
+
+/* ============================
+   OCR (Image to Text) kept as original
+===============================*/
+const OCR_API_KEY = "K85234338588957";
+const OCR_API_URL = "https://api.ocr.space/parse/image";
+
+document.getElementById("imageUpload").addEventListener("change", async function () {
+    const file = this.files[0];
+    if (!file) return;
+
+    setStatus("Extracting text...");
+
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("language", "eng");
+    formData.append("isOverlayRequired", "false");
+
+    try {
+        const response = await fetch(OCR_API_URL, {
+            method: "POST",
+            headers: { "apikey": OCR_API_KEY },
+            body: formData
+        });
+
+        const data = await response.json();
+
+        if (!data || !data.ParsedResults || !data.ParsedResults[0]) {
+            setStatus("OCR failed!");
+            return;
+        }
+
+        const text = data.ParsedResults[0].ParsedText;
+        document.getElementById("textInput").value = keepOnlyEnglish(text);
+        setStatus("OCR completed!");
+    } catch (err) {
+        console.error(err);
+        setStatus("OCR API Error!");
+    }
+});
+
+/* Clean up when leaving page */
+window.addEventListener("beforeunload", () => {
+    try { if (activeStream) activeStream.getTracks().forEach(t => t.stop()); } catch(e){}
+    try { speechSynthesis.cancel(); } catch(e){}
+    revokeLastURL();
+});
+</script>
+
+</body>
+</html>
